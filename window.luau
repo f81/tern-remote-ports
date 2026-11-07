@@ -31,6 +31,25 @@ local KV_HOSTS = "hosts" -- { string }: hosts shown in the panel (connected thro
 local KV_RECENT = "recent" -- { string }: hosts picked lately, newest first
 local RECENT_MAX = 8
 
+-- The manifest's version, read once: the panel shows it, so a bug report can
+-- name the build it came from. The manifest is the only place it lives;
+-- Tern itself never compares versions.
+local function manifest_version(): string?
+	local ok, text = pcall(tern.fs.read, "plugin.toml", 65536)
+	if not ok or type(text) ~= "string" then
+		return nil
+	end
+	for line in string.gmatch(text, "[^\n]+") do
+		local v = string.match(line, "^%s*version%s*=%s*\"([^\"]+)\"")
+		if v then
+			return v
+		end
+	end
+	return nil
+end
+
+local VERSION = manifest_version()
+
 type HostState = {
 	state: "unknown" | "up" | "down" | "connecting",
 	pid: number?,
@@ -321,7 +340,7 @@ local function view(): Node
 		then "no forwards"
 		else string.format("%d forwarded%s", #list, if up < #list then string.format(", %d up", up) else "")
 	local children: { Node } = {
-		head_row(tern.ui.text({ span(meta, "muted") }), {
+		head_row(tern.ui.text({ span(meta, "muted"), if VERSION then "  ·  ports " .. VERSION else "" }), {
 			button("Forward port…", "add", { icon = "plus", variant = "primary" }),
 			button("Refresh", "refresh", { icon = "repeat", variant = "quiet" }),
 		}),
@@ -428,13 +447,17 @@ end
 
 local forward_flow: (cx: WindowCx, host: string?) -> ()
 
--- Opens a local terminal running the master, where ssh can prompt; polls
--- until it is up, then runs `after`.
+-- Opens a terminal on this machine running the master, where ssh can
+-- prompt; polls until it is up, then runs `after`. Always "local": the
+-- master must run where the window does, and a tab on the current session
+-- would run it on whatever host that session lives on (a remote one, maybe
+-- Windows). If no local terminal opens, the command goes to the clipboard.
 local function connect_in_terminal(cx: WindowCx, host: string, after: ((cx: WindowCx) -> ())?)
 	local command = ssh.master_shell(host)
-	local ok = pcall(cx.hosts.terminal, cx.hosts, "local", { command = command })
+	local ok, err = pcall(cx.hosts.terminal, cx.hosts, "local", { command = command })
 	if not ok then
-		cx.layout:new_tab({ command = command })
+		cx:copy(command)
+		cx:toast("error", "Couldn't open a local terminal", "Copied the ssh command: run it in a terminal on this machine. " .. tostring(err))
 	end
 	remember_host(host)
 	host_state[host] = { state = "connecting" }

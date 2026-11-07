@@ -96,15 +96,19 @@ local function shell_quote(s: string): string
 	return "'" .. string.gsub(s, "'", "'\\''") .. "'"
 end
 
--- The master as a shell command line for a terminal pane, where ssh can ask
--- for passwords, passphrases and unknown host keys; `-f` backgrounds it once
--- authenticated, so the pane's command ends and the master stays.
+-- The master as a command line for a terminal pane on this machine, where
+-- ssh can ask for passwords, passphrases and unknown host keys; `-f`
+-- backgrounds it once authenticated, so the pane's command ends and the
+-- master stays. Just ssh and its arguments, no `&&` or other shell syntax,
+-- so sh, zsh, fish, cmd and PowerShell all run it the same way. Arguments
+-- are plain words; one that isn't (a socket dir with spaces) gets double
+-- quotes, which every one of those shells reads.
 function M.master_shell(host: string): string
 	local parts = {}
 	for _, a in argv(host, MASTER_OPTS) do
-		table.insert(parts, if string.find(a, "^[%w%._@/=:%-]+$") then a else shell_quote(a))
+		table.insert(parts, if string.find(a, "^[%w%._@/=:%-%[%]]+$") then a else '"' .. a .. '"')
 	end
-	return table.concat(parts, " ") .. " && echo 'Connected: Tern Ports can forward through " .. host .. " now.'"
+	return table.concat(parts, " ")
 end
 
 function M.check(host: string): { string }

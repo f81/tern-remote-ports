@@ -4,6 +4,15 @@ A Tern plugin that forwards localhost ports to ports on ssh hosts, like
 VS Code's Ports view: pick a host, pick one of the ports listening there,
 and it is on `localhost`.
 
+## Install
+
+```sh
+tern plugin install github.com/f81/tern-remote-ports
+```
+
+To work on the plugin itself, link a checkout instead; Tern loads it from
+there and reloads it when you save:
+
 ```sh
 tern plugin link ~/Documents/tern-plugins/ports
 ```
@@ -67,6 +76,29 @@ the same master where ssh can ask. The plugin waits for the master (up to
 Masters only start when you ask. When a link drops, the panel shows the host
 as disconnected with a **Connect** button, and its forwards come back once
 it is connected again.
+
+## Versions
+
+The version lives in `plugin.toml` (`version = "0.1.0"`), and the Ports
+panel shows it in its head, so a bug report can name the build it came
+from. Tern never compares versions: it shows the one you have and leaves
+updating to you.
+
+Releases are git tags, `v0.1.0`, `v0.2.0`, …, each with a GitHub release
+and its notes. `tern plugin install` clones the tip of the default branch,
+so pinning a release means cloning the tag yourself:
+
+```sh
+git clone --branch v0.1.0 --depth 1 https://github.com/f81/tern-remote-ports
+tern plugin install ./tern-remote-ports
+```
+
+To follow the tip instead, install from the repository and update with
+`tern plugin install github.com/f81/tern-remote-ports --force`, or
+`git pull` in a linked checkout.
+
+Release commits are titled `ports <version>: <what changed>`, and the tag
+carries the same version.
 
 ## Requirements
 
