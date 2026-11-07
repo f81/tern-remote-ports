@@ -294,8 +294,8 @@ local function host_block(host: string): Node
 			local t = tern.ui.table({
 				{ id = "port", head = "Port", align = "end", mono = true },
 				{ id = "addr", head = "Listening on", mono = true, grow = 1, truncate = "end", priority = -1 },
-				{ id = "proc", head = "Program" },
-				{ id = "act", head = "", align = "end" },
+				{ id = "proc", head = "Program", align = "center" },
+				{ id = "act", head = "", align = "center" },
 			}, rows, { empty = "Nothing listens on TCP there" })
 			t.p = t.p or {}
 			;(t.p :: any).key = "scan:" .. host
