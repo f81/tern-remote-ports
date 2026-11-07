@@ -13,10 +13,13 @@ tern plugin link ~/Documents/tern-plugins/ports
 | Palette command | Does |
 | --- | --- |
 | Forward a port from an ssh host… | Picks a host (recent ones, Tern's remote hosts, `~/.ssh/config`, or any `user@host`), lists the TCP ports listening there, forwards the one you pick. **Another port…** takes `8080`, `3000:8080` (local:remote), `db.internal:5432` or `5432:db.internal:5432` (through the host) |
-| Show forwarded ports | A panel: the forwards with their state, Open and Stop, and per host the listening ports with a Forward button, Rescan, Disconnect |
+| Show forwarded ports | A panel: the forwards with their state, Open and Stop, and per host the listening ports with a Forward button (a port already forwarded shows a green `localhost:N` button that opens it), Rescan, Disconnect |
 | Stop forwarding a port… | Cancels one forward |
 | Open a forwarded port in the browser… | Opens `http://localhost:<port>` |
 | Disconnect an ssh host from Ports… | Ends the host's ssh connection and its forwards |
+
+Opening a port follows Tern's "Where web links open" setting (`link_target`):
+`Browser` uses the system's default browser, `Tern` a Tern browser tab.
 
 The status line shows the forwards (`localhost:3000`, `2 ports`, `… · 1 down`);
 clicking it opens the panel.

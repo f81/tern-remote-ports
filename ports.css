@@ -1,0 +1,12 @@
+/* A forwarded port in a host's listening table: a button that looks like the
+   success badge (tone text, 10% tint, 22% ring) and opens the port. */
+.sf-table[data-role='ports.listening'] .sf-button[data-act^='open:'] {
+	color: var(--ok);
+	background: color-mix(in srgb, var(--ok) 10%, transparent);
+	box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ok) 22%, transparent);
+	border-radius: 999px;
+}
+
+.sf-table[data-role='ports.listening'] .sf-button[data-act^='open:']:hover {
+	background: color-mix(in srgb, var(--ok) 18%, transparent);
+}

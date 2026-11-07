@@ -286,7 +286,8 @@ local function host_block(host: string): Node
 						span(table.concat(l.addrs, " "), "mono muted"),
 						l.process or "",
 						if f
-							then { badge = { text = "localhost:" .. f.lport, tone = "success" } }
+							-- Green (ports.css) and opens like a link: Tern's "Open links in" setting picks the browser.
+							then { button = { text = "localhost:" .. f.lport, act = "open:" .. f.lport, icon = "globe" } }
 							else { button = { text = "Forward", act = "fwd:" .. host .. "|" .. l.target .. "|" .. l.port, icon = "swap", variant = "quiet" } },
 					},
 				})
@@ -299,6 +300,7 @@ local function host_block(host: string): Node
 			}, rows, { empty = "Nothing listens on TCP there" })
 			t.p = t.p or {}
 			;(t.p :: any).key = "scan:" .. host
+			;(t.p :: any).role = "ports.listening"
 			table.insert(children, t)
 		end
 	end
@@ -925,9 +927,15 @@ local function show(cx: WindowCx)
 	reconcile({ scan = true, force = true })
 end
 
+-- cx:open follows the `link_target` setting (Settings › "Where web links
+-- open"): the system's default browser for "Browser", a Tern browser block
+-- for "Tern".
 local function open_port(cx: WindowCx, lport: number)
 	cx:open("http://localhost:" .. lport)
 end
+
+-- The green forwarded-port buttons; scoped by the table's data-role.
+tern.css("ports", tern.fs.read("ports.css"))
 
 local function has_forwards(_cx: WindowCx): boolean
 	return #forwards() > 0
