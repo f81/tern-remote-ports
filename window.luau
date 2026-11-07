@@ -1,14 +1,20 @@
 --!strict
 -- Tern Ports, window half: forwards localhost ports to ports on ssh hosts.
 --
--- Every forward rides one OpenSSH control master per host (`lib/ssh.luau`),
--- so each action is a short `ssh -O …` command and the forwards stay up while
--- that master does, across windows and plugin reloads. The forwards the user
--- asked for live in `tern.kv` (shared by every window); what is actually up is
--- read back from ssh (`-O check`) and from this machine's listening sockets
--- (`lsof`), every TICK_MS. A forward whose master is up but whose port isn't
--- held (after a reconnect) is added again; the mux ignores duplicates, so two
--- windows doing it at once is harmless. Masters only start on a user action.
+-- On macOS and Linux every forward rides one OpenSSH control master per host
+-- (`lib/ssh.luau`), so each action is a short `ssh -O …` command and the
+-- forwards stay up while that master does, across windows and plugin
+-- reloads. Windows' ssh has no control masters, so there each forward is its
+-- own `ssh -N -L` process ("direct" mode, `ssh.MULTIPLEX` false) and a host
+-- counts as connected once ssh logs in to it without prompts.
+--
+-- The forwards the user asked for live in `tern.kv` (shared by every
+-- window); what is actually up is read back every TICK_MS from ssh
+-- (`-O check`) and this machine's listening sockets (lsof, or netstat on
+-- Windows). A forward whose host is connected but whose port isn't held
+-- (after a reconnect) is started again; a duplicate fails to bind and goes
+-- away, so two windows doing it at once is harmless. Connections only start
+-- on a user action.
 --
 -- All of it runs here, not in the host half: the window half runs on this
 -- machine, the host half wherever the panes run (possibly the remote itself).
@@ -21,6 +27,8 @@ type Listener = ssh.Listener
 local TITLE = "Ports"
 local SHOW = "plugin." .. tern.plugin.id .. ".show"
 local TICK_MS = 10000
+-- Direct mode: how long a new forward process gets to hold its port.
+local TUNNEL_WAIT_MS = 30000
 -- A panel rescans a host's listening ports at most this often on its own.
 local SCAN_EVERY_MS = 30000
 -- How long "Connect in a terminal" waits for the master to come up.
@@ -63,9 +71,15 @@ local host_state: { [string]: HostState } = {}
 local fwd_state: { [string]: FwdState } = {}
 local fwd_error: { [string]: string } = {}
 local scans: { [string]: Scan } = {}
--- Port → pids listening on it here; nil when lsof isn't available.
-local local_ports: { [number]: { [number]: boolean } }? = nil
--- Callbacks waiting on a master being started, by host.
+-- Port → pids listening on it here, and those pids' program names; nil when
+-- lsof isn't available.
+local local_ports: ssh.LocalPorts? = nil
+local local_names: { [number]: string } = {}
+-- Direct mode: forward processes this VM started, by forward key. `settled`
+-- once the start reported back; `stopping` when we end it on purpose.
+type Tunnel = { settled: boolean, stopping: boolean }
+local tunnels: { [string]: Tunnel } = {}
+-- Callbacks waiting on a host being connected, by host.
 local starting: { [string]: { (ok: boolean, err: string?, cx: WindowCx) -> () } } = {}
 local reconciling = false
 local reconcile_started = 0
@@ -177,12 +191,36 @@ end
 local function refresh_local(cb: (cx: WindowCx) -> ())
 	run(ssh.LOCAL_LISTENERS, 5000, function(res, cx)
 		-- lsof exits 1 when nothing listens; -1 means it isn't installed.
-		local_ports = if res.status >= 0 then ssh.parse_local(res.stdout) else nil
+		if res.status >= 0 then
+			local ports, names = ssh.parse_local(res.stdout)
+			local_ports, local_names = ports, names
+		else
+			local_ports, local_names = nil, {}
+		end
 		cb(cx)
 	end)
 end
 
+-- Direct mode: pids of ssh processes holding lport here.
+local function ssh_holders(lport: number): { number }
+	local out = {}
+	for pid in (local_ports and (local_ports :: ssh.LocalPorts)[lport]) or {} do
+		if ssh.is_ssh(local_names[pid]) then
+			table.insert(out, pid)
+		end
+	end
+	return out
+end
+
+-- Reads whether host's master runs. Direct mode has nothing to ask: a host
+-- is connected from a login (ensure_connected) until a forward's ssh drops.
 local function check(host: string, cb: (cx: WindowCx) -> ())
+	if not ssh.MULTIPLEX then
+		tern.timer(0, function(cx: WindowCx?)
+			cb(cx :: WindowCx)
+		end)
+		return
+	end
 	run(ssh.check(host), 5000, function(res, cx)
 		local pid = ssh.master_pid(res.stderr .. res.stdout)
 		if pid then
@@ -388,7 +426,7 @@ local function render(cx: WindowCx)
 end
 
 ---------------------------------------------------------------------------
--- Masters
+-- Connections
 
 local function finish_start(host: string, ok: boolean, err: string?, cx: WindowCx)
 	local waiting = starting[host] or {}
@@ -398,13 +436,44 @@ local function finish_start(host: string, ok: boolean, err: string?, cx: WindowC
 	end
 end
 
--- Calls cb(true) once host's master runs, starting one (without prompts) if needed.
-local function ensure_master(host: string, cb: (ok: boolean, err: string?, cx: WindowCx) -> ())
+-- Direct mode: a login without prompts, which each forward will repeat.
+local function probe(host: string, cb: (ok: boolean, err: string?, cx: WindowCx) -> ())
+	run(ssh.probe(host), 20000, function(res, cx)
+		if res.status == 0 then
+			cb(true, nil, cx)
+		else
+			cb(false, if res.timed_out then "timed out connecting" else ssh.error_line(res.stderr), cx)
+		end
+	end)
+end
+
+-- Calls cb(true) once host is connected: its master runs, starting one
+-- (without prompts) if needed, or in direct mode ssh logs in without prompts.
+local function ensure_connected(host: string, cb: (ok: boolean, err: string?, cx: WindowCx) -> ())
 	if starting[host] then
 		table.insert(starting[host], cb)
 		return
 	end
 	starting[host] = { cb }
+	if not ssh.MULTIPLEX then
+		local hs = host_state[host]
+		if hs and hs.state == "up" then
+			tern.timer(0, function(cx: WindowCx?)
+				finish_start(host, true, nil, cx :: WindowCx)
+			end)
+			return
+		end
+		host_state[host] = { state = "connecting" }
+		probe(host, function(ok, err, cx)
+			host_state[host] = if ok then { state = "up" } else { state = "down", error = err }
+			if ok then
+				remember_host(host)
+			end
+			render(cx)
+			finish_start(host, ok, err, cx)
+		end)
+		return
+	end
 	run(ssh.check(host), 5000, function(res, cx)
 		local pid = ssh.master_pid(res.stderr .. res.stdout)
 		if pid then
@@ -447,13 +516,15 @@ end
 
 local forward_flow: (cx: WindowCx, host: string?) -> ()
 
--- Opens a terminal on this machine running the master, where ssh can
--- prompt; polls until it is up, then runs `after`. Always "local": the
--- master must run where the window does, and a tab on the current session
--- would run it on whatever host that session lives on (a remote one, maybe
--- Windows). If no local terminal opens, the command goes to the clipboard.
+-- Opens a terminal on this machine where ssh can prompt, then polls until
+-- the host is connected and runs `after`. The terminal runs the master, or
+-- in direct mode one login (to accept a host key; a password can't carry
+-- over to the forwards, which log in without prompts). Always "local": ssh
+-- must run where the window does, and a tab on the current session would
+-- run it on whatever host that session lives on. If no local terminal
+-- opens, the command goes to the clipboard.
 local function connect_in_terminal(cx: WindowCx, host: string, after: ((cx: WindowCx) -> ())?)
-	local command = ssh.master_shell(host)
+	local command = if ssh.MULTIPLEX then ssh.master_shell(host) else ssh.probe_shell(host)
 	local ok, err = pcall(cx.hosts.terminal, cx.hosts, "local", { command = command })
 	if not ok then
 		cx:copy(command)
@@ -463,24 +534,46 @@ local function connect_in_terminal(cx: WindowCx, host: string, after: ((cx: Wind
 	host_state[host] = { state = "connecting" }
 	render(cx)
 	local deadline = tern.now() + TERMINAL_WAIT_MS
+	local function connected(pcx: WindowCx, pid: number?)
+		host_state[host] = { state = "up", pid = pid }
+		pcx:toast("success", "Connected to " .. host)
+		render(pcx)
+		if after then
+			after(pcx)
+		end
+	end
 	local function poll()
-		tern.timer(2000, function(tcx: WindowCx?)
-			run(ssh.check(host), 5000, function(res, pcx)
-				local pid = ssh.master_pid(res.stderr .. res.stdout)
-				if pid then
-					host_state[host] = { state = "up", pid = pid }
-					pcx:toast("success", "Connected to " .. host)
-					render(pcx)
-					if after then
-						after(pcx)
-					end
-				elseif tern.now() < deadline then
+		tern.timer(2000, function(_tcx: WindowCx?)
+			local function retry(pcx: WindowCx, last_err: string?)
+				if tern.now() < deadline then
 					poll()
-				else
-					host_state[host] = { state = "down", error = "not connected" }
-					render(pcx)
+					return
 				end
-			end)
+				local why = if ssh.MULTIPLEX
+					then "not connected"
+					else "needs a key or ssh-agent: on Windows each forward logs in again, without prompts ("
+						.. (last_err or "not connected") .. ")"
+				host_state[host] = { state = "down", error = why }
+				render(pcx)
+			end
+			if ssh.MULTIPLEX then
+				run(ssh.check(host), 5000, function(res, pcx)
+					local pid = ssh.master_pid(res.stderr .. res.stdout)
+					if pid then
+						connected(pcx, pid)
+					else
+						retry(pcx, nil)
+					end
+				end)
+			else
+				probe(host, function(pok, perr, pcx)
+					if pok then
+						connected(pcx, nil)
+					else
+						retry(pcx, perr)
+					end
+				end)
+			end
 		end)
 	end
 	poll()
@@ -539,13 +632,99 @@ local function taken(port: number): boolean
 	return false
 end
 
+local function find_forward(k: string): Forward?
+	for _, f in forwards() do
+		if key_of(f) == k then
+			return f
+		end
+	end
+	return nil
+end
+
+-- Direct mode: starts f's ssh process; cb(true) once ssh holds its port
+-- here, cb(false, err) if it exits first. A later exit (the link died)
+-- marks the forward and its host down, unless we ended it on purpose.
+local function start_tunnel(f: Forward, cb: (ok: boolean, err: string?, cx: WindowCx) -> ())
+	local k = key_of(f)
+	local t: Tunnel = { settled = false, stopping = false }
+	tunnels[k] = t
+	run(ssh.tunnel(f), 0, function(res, cx)
+		if tunnels[k] == t then
+			tunnels[k] = nil
+		end
+		local err = if string.find(res.stderr, "%S") then ssh.error_line(res.stderr) else "SSH tunnel exited; reconnect to restore forwarding"
+		if not t.settled then
+			t.settled = true
+			cb(false, err, cx)
+		elseif not t.stopping and find_forward(k) then
+			fwd_state[k] = "down"
+			fwd_error[k] = err
+			host_state[f.host] = { state = "down", error = err }
+			render(cx)
+		end
+	end)
+	local deadline = tern.now() + TUNNEL_WAIT_MS
+	local function poll()
+		tern.timer(500, function(_cx: WindowCx?)
+			if t.settled then
+				return
+			end
+			refresh_local(function(cx)
+				if t.settled then
+					return
+				end
+				if #ssh_holders(f.lport) > 0 then
+					t.settled = true
+					cb(true, nil, cx)
+				elseif tern.now() >= deadline then
+					t.settled = true
+					t.stopping = true
+					cb(false, "timed out connecting", cx)
+				else
+					poll()
+				end
+			end)
+		end)
+	end
+	poll()
+end
+
+-- Direct mode: ends f's ssh process, found by the port it holds.
+local function kill_tunnel(f: Forward)
+	local t = tunnels[key_of(f)]
+	if t then
+		t.stopping = true
+	end
+	for _, pid in ssh_holders(f.lport) do
+		run(ssh.kill(pid), 5000, function() end)
+	end
+end
+
+-- Starts forwarding f on a connected host: cb(true) once it is up.
+local function open_forward(f: Forward, cb: (ok: boolean, err: string?, cx: WindowCx) -> ())
+	if not ssh.MULTIPLEX then
+		start_tunnel(f, cb)
+		return
+	end
+	run(ssh.forward(f), 8000, function(res, cx)
+		cb(res.status == 0, if res.status == 0 then nil else ssh.error_line(res.stderr), cx)
+	end)
+end
+
+-- Whether ssh's error says the local port couldn't be bound, so another
+-- port may work: `Port forwarding failed`, `Could not request local forwarding`.
+local function bind_failed(err: string?): boolean
+	local e = string.lower(err or "")
+	return string.find(e, "forwarding", 1, true) ~= nil or string.find(e, "bind", 1, true) ~= nil or string.find(e, "in use", 1, true) ~= nil
+end
+
 local function add_forward(cx: WindowCx, host: string, rhost: string, rport: number, lport: number?)
 	local existing = forward_of(host, rhost, rport)
 	if existing and (lport == nil or existing.lport == lport) then
 		cx:toast("info", string.format("Already forwarded at localhost:%d", existing.lport), host .. " " .. remote_label(existing))
 		return
 	end
-	ensure_master(host, function(ok, err, cx1)
+	ensure_connected(host, function(ok, err, cx1)
 		if not ok then
 			connect_failed(cx1, host, err, function(cx2)
 				add_forward(cx2, host, rhost, rport, lport)
@@ -575,9 +754,13 @@ local function add_forward(cx: WindowCx, host: string, rhost: string, rport: num
 					return
 				end
 				local f: Forward = { host = host, lport = p, rhost = rhost, rport = rport }
-				run(ssh.forward(f), 8000, function(res, cx4)
-					if res.status ~= 0 then
-						try(i + 1, ssh.error_line(res.stderr), cx4)
+				open_forward(f, function(fok, ferr, cx4)
+					if not fok then
+						if bind_failed(ferr) then
+							try(i + 1, ferr, cx4)
+						else
+							cx4:toast("error", "Couldn't forward " .. host .. " " .. rhost .. ":" .. rport, ferr)
+						end
 						return
 					end
 					local list = forwards()
@@ -595,13 +778,16 @@ local function add_forward(cx: WindowCx, host: string, rhost: string, rport: num
 	end)
 end
 
-local function find_forward(k: string): Forward?
-	for _, f in forwards() do
-		if key_of(f) == k then
-			return f
+local function remove_forward(k: string)
+	local kept = {}
+	for _, g in forwards() do
+		if key_of(g) ~= k then
+			table.insert(kept, g)
 		end
 	end
-	return nil
+	set_forwards(kept)
+	fwd_state[k] = nil
+	fwd_error[k] = nil
 end
 
 local function stop_forward(k: string)
@@ -610,16 +796,17 @@ local function stop_forward(k: string)
 		return
 	end
 	local fwd = f :: Forward
+	if not ssh.MULTIPLEX then
+		refresh_local(function(cx)
+			remove_forward(k)
+			kill_tunnel(fwd)
+			cx:toast("success", "Stopped forwarding localhost:" .. fwd.lport)
+			render(cx)
+		end)
+		return
+	end
 	run(ssh.cancel(fwd), 8000, function(res, cx)
-		local kept = {}
-		for _, g in forwards() do
-			if key_of(g) ~= k then
-				table.insert(kept, g)
-			end
-		end
-		set_forwards(kept)
-		fwd_state[k] = nil
-		fwd_error[k] = nil
+		remove_forward(k)
 		local up = host_state[fwd.host]
 		if res.status ~= 0 and up and up.state == "up" then
 			cx:toast("error", "ssh didn't confirm stopping localhost:" .. fwd.lport, ssh.error_line(res.stderr))
@@ -631,6 +818,19 @@ local function stop_forward(k: string)
 end
 
 local function disconnect(host: string)
+	if not ssh.MULTIPLEX then
+		refresh_local(function(cx)
+			for _, f in forwards() do
+				if f.host == host then
+					kill_tunnel(f)
+				end
+			end
+			forget_host(host)
+			cx:toast("success", "Disconnected " .. host)
+			render(cx)
+		end)
+		return
+	end
 	run(ssh.exit(host), 8000, function(_res, cx)
 		forget_host(host)
 		pcall(tern.fs.remove, ssh.socket(host))
@@ -666,8 +866,8 @@ local function scan(host: string, cb: (cx: WindowCx) -> ())
 	attempt(first, nil)
 end
 
--- Reads back what is up, restores forwards whose master is up but whose port
--- isn't held, rescans hosts when asked, then renders.
+-- Reads back what is up, restores forwards whose host is connected but whose
+-- port isn't held, rescans hosts when asked, then renders.
 local function reconcile(opts: { scan: boolean, force: boolean? })
 	-- Every process has a timeout, so a reading finishes; the age check only
 	-- recovers from a callback that raised halfway.
@@ -681,43 +881,55 @@ local function reconcile(opts: { scan: boolean, force: boolean? })
 
 	local function apply(cx: WindowCx)
 		reconciling = false
+		if not ssh.MULTIPLEX and local_ports then
+			-- Direct mode, fresh VM (a reload, a new window): a host is
+			-- connected when ssh still holds one of its forwards.
+			for _, f in forwards() do
+				if host_state[f.host] == nil then
+					host_state[f.host] = if #ssh_holders(f.lport) > 0 then { state = "up" } else nil
+				end
+			end
+			for _, host in hosts do
+				host_state[host] = host_state[host] or { state = "down" }
+			end
+		end
 		for _, f in forwards() do
 			local k = key_of(f)
 			local hs = host_state[f.host]
-			if not hs or hs.state ~= "up" then
-				fwd_state[k] = if hs and hs.state == "connecting" then "unknown" else "down"
-			elseif local_ports == nil then
+			local up = hs ~= nil and hs.state == "up"
+			if local_ports == nil then
+				fwd_state[k] = if up then "up" elseif hs and hs.state == "connecting" then "unknown" else "down"
+				continue
+			end
+			-- Ours is the master's pid, or in direct mode any ssh. Up only when
+			-- ours alone holds the port: ssh binds 127.0.0.1 and ::1 and
+			-- succeeds if either binds, so another program can hold the other
+			-- one and catch the connections.
+			local ours = false
+			local others = {}
+			for pid in (local_ports :: ssh.LocalPorts)[f.lport] or {} do
+				local mine = if ssh.MULTIPLEX then up and pid == (hs :: HostState).pid else ssh.is_ssh(local_names[pid])
+				if mine then
+					ours = true
+				else
+					table.insert(others, tostring(pid))
+				end
+			end
+			if #others > 0 and (ours or up) then
+				fwd_state[k] = "conflict"
+				fwd_error[k] = "localhost:" .. f.lport .. " is also held by pid " .. table.concat(others, ", ")
+			elseif ours then
 				fwd_state[k] = "up"
-			else
-				-- Up only when the master alone holds the port: ssh binds 127.0.0.1
-				-- and ::1 and succeeds if either binds, so another program can
-				-- hold the other one and catch the connections.
-				local holders = (local_ports :: any)[f.lport]
-				local others = {}
-				for pid in holders or {} do
-					if pid ~= hs.pid then
-						table.insert(others, tostring(pid))
-					end
-				end
-				if #others > 0 then
-					fwd_state[k] = "conflict"
-					fwd_error[k] = "localhost:" .. f.lport .. " is also held by pid " .. table.concat(others, ", ")
-				elseif holders then
-					fwd_state[k] = "up"
-					fwd_error[k] = nil
-				elseif fwd_state[k] ~= "restoring" then
-					fwd_state[k] = "restoring"
-					run(ssh.forward(f), 8000, function(res, rcx)
-						if res.status == 0 then
-							fwd_state[k] = "up"
-							fwd_error[k] = nil
-						else
-							fwd_state[k] = "down"
-							fwd_error[k] = ssh.error_line(res.stderr)
-						end
-						render(rcx)
-					end)
-				end
+				fwd_error[k] = nil
+			elseif up and fwd_state[k] ~= "restoring" and not tunnels[k] then
+				fwd_state[k] = "restoring"
+				open_forward(f, function(ok, err, rcx)
+					fwd_state[k] = if ok then "up" else "down"
+					fwd_error[k] = err
+					render(rcx)
+				end)
+			elseif not up and fwd_state[k] ~= "restoring" then
+				fwd_state[k] = if hs and hs.state == "connecting" then "unknown" else "down"
 			end
 		end
 		render(cx)
@@ -751,8 +963,9 @@ end
 ---------------------------------------------------------------------------
 -- Pickers
 
+-- Where ~/.ssh lives: HOME, or on Windows USERPROFILE (ssh reads both).
 local function home(): string
-	return tern.getenv("HOME") or ""
+	return tern.getenv("HOME") or tern.getenv("USERPROFILE") or ""
 end
 
 local function ssh_config_hosts(): { string }
@@ -768,9 +981,10 @@ local function ssh_config_hosts(): { string }
 			return
 		end
 		for _, h in ssh.parse_config(text, function(inc: string)
+			inc = string.gsub(inc, "\\", "/")
 			if string.sub(inc, 1, 2) == "~/" then
 				inc = home() .. string.sub(inc, 2)
-			elseif string.sub(inc, 1, 1) ~= "/" then
+			elseif string.sub(inc, 1, 1) ~= "/" and not string.find(inc, "^%a:/") then
 				inc = home() .. "/.ssh/" .. inc
 			end
 			local dir, name = string.match(inc, "^(.*)/([^/]*)$")
@@ -905,7 +1119,7 @@ forward_flow = function(cx: WindowCx, host: string?)
 		return
 	end
 	local h = host :: string
-	ensure_master(h, function(ok, err, cx2)
+	ensure_connected(h, function(ok, err, cx2)
 		if not ok then
 			connect_failed(cx2, h, err, function(cx3)
 				forward_flow(cx3, h)
@@ -1066,7 +1280,7 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		scan(arg :: string, render)
 	elseif act == "connect" then
 		local host = arg :: string
-		ensure_master(host, function(ok, err, cx2)
+		ensure_connected(host, function(ok, err, cx2)
 			if ok then
 				reconcile({ scan = true, force = true })
 			else

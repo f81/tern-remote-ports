@@ -1,8 +1,14 @@
 --!strict
--- OpenSSH plumbing for the window half: one control master per host, kept on
--- a control socket, carries every forward. Each step is a short `ssh -O …`
--- command, so nothing the plugin starts outlives it except the master, which
--- `ssh -O exit` ends. Pure functions here: argv builders and parsers.
+-- OpenSSH plumbing for the window half. Pure functions here: argv builders
+-- and parsers. Two ways to hold forwards, by what this machine's ssh can do:
+--
+-- * Multiplexed (macOS, Linux): one control master per host, kept on a
+--   control socket, carries every forward. Each step is a short `ssh -O …`
+--   command, so nothing the plugin starts outlives it except the master,
+--   which `ssh -O exit` ends.
+-- * Direct (Windows): Win32-OpenSSH has no control sockets (`ControlMaster`
+--   fails with "getsockname failed: Not a socket"), so each forward is its
+--   own `ssh -N -L …` process, ended with taskkill.
 
 local M = {}
 
@@ -56,14 +62,22 @@ function M.socket(host: string): string
 	return socket_dir() .. "/tern-ports-" .. fnv(host) .. ".sock"
 end
 
-local function control(host: string): { string }
-	return { "-o", "ControlPath=" .. M.socket(host) }
-end
+-- Whether this machine's ssh shares one connection per host (see the top).
+M.MULTIPLEX = tern.runtime.os ~= "windows"
 
--- `ssh -o ControlPath=… <options> -- <host> [<remote command>]`.
+-- `ssh [-o ControlPath=…] <options> -- <host> [<remote command>]`; no
+-- ControlPath in direct mode, where ssh would try the socket and fail.
 local function argv(host: string, options: { string }, command: string?): { string }
 	local out = { "ssh" }
-	table.move(control(host), 1, 2, #out + 1, out)
+	if M.MULTIPLEX then
+		table.insert(out, "-o")
+		table.insert(out, "ControlPath=" .. M.socket(host))
+	else
+		table.insert(out, "-o")
+		table.insert(out, "ControlMaster=no")
+		table.insert(out, "-o")
+		table.insert(out, "ControlPath=none")
+	end
 	table.move(options, 1, #options, #out + 1, out)
 	table.insert(out, "--")
 	table.insert(out, host)
@@ -71,6 +85,18 @@ local function argv(host: string, options: { string }, command: string?): { stri
 		table.insert(out, command)
 	end
 	return out
+end
+
+-- A command line from argv for a terminal pane on this machine: no shell
+-- syntax, so sh, zsh, fish, cmd and PowerShell run it the same way. Plain
+-- words stay bare; others (a socket dir with spaces) get double quotes,
+-- which every one of those shells reads.
+local function command_line(args: { string }): string
+	local parts = {}
+	for _, a in args do
+		table.insert(parts, if string.find(a, "^[%w%._@/=:%-%[%]]+$") then a else '"' .. a .. '"')
+	end
+	return table.concat(parts, " ")
 end
 
 -- Options of the master: no prompts (a terminal handles those, see
@@ -96,19 +122,49 @@ local function shell_quote(s: string): string
 	return "'" .. string.gsub(s, "'", "'\\''") .. "'"
 end
 
--- The master as a command line for a terminal pane on this machine, where
--- ssh can ask for passwords, passphrases and unknown host keys; `-f`
--- backgrounds it once authenticated, so the pane's command ends and the
--- master stays. Just ssh and its arguments, no `&&` or other shell syntax,
--- so sh, zsh, fish, cmd and PowerShell all run it the same way. Arguments
--- are plain words; one that isn't (a socket dir with spaces) gets double
--- quotes, which every one of those shells reads.
+-- The master in a terminal pane on this machine, where ssh can ask for
+-- passwords, passphrases and unknown host keys; `-f` backgrounds it once
+-- authenticated, so the pane's command ends and the master stays.
 function M.master_shell(host: string): string
-	local parts = {}
-	for _, a in argv(host, MASTER_OPTS) do
-		table.insert(parts, if string.find(a, "^[%w%._@/=:%-%[%]]+$") then a else '"' .. a .. '"')
-	end
-	return table.concat(parts, " ")
+	return command_line(argv(host, MASTER_OPTS))
+end
+
+-- Direct mode: whether host lets us in without prompts (keys, an agent, a
+-- known host key); every forward process logs in the same way.
+function M.probe(host: string): { string }
+	return argv(host, { "-o", "BatchMode=yes", "-o", "ConnectTimeout=10" }, "exit")
+end
+
+-- Direct mode, in a terminal pane: one login where ssh can ask (above all,
+-- to accept a new host key), then out. Passwords don't carry over: each
+-- forward logs in again, without prompts.
+function M.probe_shell(host: string): string
+	return command_line(argv(host, { "-o", "ConnectTimeout=10" }, "exit"))
+end
+
+-- Direct mode: one forward as its own process, up while it runs. It exits
+-- when the port can't be bound (ExitOnForwardFailure) or the link dies.
+function M.tunnel(f: Forward): { string }
+	return argv(f.host, {
+		"-N", "-n",
+		"-o", "BatchMode=yes",
+		"-o", "ExitOnForwardFailure=yes",
+		"-o", "ConnectTimeout=10",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=3",
+		"-L", M.spec(f),
+	})
+end
+
+-- Direct mode: ends a forward process.
+function M.kill(pid: number): { string }
+	return { "taskkill", "/PID", tostring(pid), "/F" }
+end
+
+-- Whether a program name from parse_local is ssh (`ssh`, `ssh.exe`).
+function M.is_ssh(name: string?): boolean
+	local n = name and string.lower(name)
+	return n == "ssh" or n == "ssh.exe"
 end
 
 function M.check(host: string): { string }
@@ -164,8 +220,12 @@ function M.scanned(out: string): boolean
 	return string.find(out, "^@%a+") ~= nil or string.find(out, "\n@%a+") ~= nil
 end
 
--- This machine's listening TCP sockets, `-F` fields: `p<pid>` then `n<addr>` lines.
-M.LOCAL_LISTENERS = { "lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn" }
+-- This machine's listening TCP sockets with their pids and program names:
+-- `lsof -F` fields (`p<pid>`, `c<command>`, `n<addr>` lines), or on Windows
+-- netstat and tasklist as the remote Windows scan runs them.
+M.LOCAL_LISTENERS = if tern.runtime.os == "windows"
+	then { "cmd", "/c", "netstat -ano -p TCP & tasklist /fo csv /nh" }
+	else { "lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn" }
 
 -- `Master running (pid=N)` from `-O check`; nil when no master answers.
 function M.master_pid(out: string): number?
@@ -185,25 +245,6 @@ function M.error_line(stderr: string): string
 	return if last == "" then "ssh failed" else last
 end
 
--- Port → set of pids from `lsof -Fpn`.
-function M.parse_local(out: string): { [number]: { [number]: boolean } }
-	local ports: { [number]: { [number]: boolean } } = {}
-	local pid: number? = nil
-	for line in string.gmatch(out, "[^\n]+") do
-		local tag, rest = string.sub(line, 1, 1), string.sub(line, 2)
-		if tag == "p" then
-			pid = tonumber(rest)
-		elseif tag == "n" and pid then
-			local port = tonumber(string.match(rest, ":(%d+)$") or "")
-			if port then
-				ports[port] = ports[port] or {}
-				ports[port][pid] = true
-			end
-		end
-	end
-	return ports
-end
-
 local function split_addr(s: string, sep: string): (string?, number?)
 	local addr, port = string.match(s, "^(.*)" .. sep .. "(%d+)$")
 	if not addr then
@@ -211,6 +252,64 @@ local function split_addr(s: string, sep: string): (string?, number?)
 	end
 	addr = string.gsub(addr, "%%.*$", "") -- `127.0.0.53%lo` → `127.0.0.53`
 	return addr, tonumber(port)
+end
+
+type WindowsRow = { addr: string, port: number, pid: number }
+
+-- Listeners in Windows `netstat -ano` output, and the program names that
+-- `tasklist /fo csv /nh` rows (`"name.exe","1234",…`) give their pids.
+-- Rows read `TCP 0.0.0.0:135 0.0.0.0:0 LISTENING 1012`; the state word is
+-- localized, so a listener is what has no foreign port.
+local function windows_listeners(out: string): ({ WindowsRow }, { [number]: string })
+	local names: { [number]: string } = {}
+	for name, pid in string.gmatch(out, '\n"([^"]*)","(%d+)"') do
+		names[tonumber(pid) :: number] = name
+	end
+	local rows: { WindowsRow } = {}
+	for line in string.gmatch(out, "[^\r\n]+") do
+		local proto, laddr, faddr, pid = string.match(line, "^%s*(%u+)%s+(%S+)%s+(%S+)%s+%S+%s+(%d+)%s*$")
+		if proto == "TCP" and string.find(faddr :: string, ":0$") then
+			local addr, port = split_addr(laddr :: string, ":")
+			if addr and port then
+				table.insert(rows, { addr = addr, port = port, pid = tonumber(pid) :: number })
+			end
+		end
+	end
+	return rows, names
+end
+
+export type LocalPorts = { [number]: { [number]: boolean } }
+
+-- Port → set of pids, and pid → program name, from LOCAL_LISTENERS' output.
+function M.parse_local(out: string): (LocalPorts, { [number]: string })
+	local ports: LocalPorts = {}
+	local function add(port: number, pid: number)
+		ports[port] = ports[port] or {}
+		ports[port][pid] = true
+	end
+	if tern.runtime.os == "windows" then
+		local rows, names = windows_listeners(out)
+		for _, r in rows do
+			add(r.port, r.pid)
+		end
+		return ports, names
+	end
+	local names: { [number]: string } = {}
+	local pid: number? = nil
+	for line in string.gmatch(out, "[^\n]+") do
+		local tag, rest = string.sub(line, 1, 1), string.sub(line, 2)
+		if tag == "p" then
+			pid = tonumber(rest)
+		elseif tag == "c" and pid then
+			names[pid] = rest
+		elseif tag == "n" and pid then
+			local port = tonumber(string.match(rest, ":(%d+)$") or "")
+			if port then
+				add(port, pid)
+			end
+		end
+	end
+	return ports, names
 end
 
 local WILDCARD = { ["0.0.0.0"] = true, ["*"] = true, ["::"] = true, ["[::]"] = true }
@@ -247,22 +346,16 @@ function M.parse_scan(out: string): { Listener }
 		end
 		l.process = l.process or process
 	end
-	-- Windows tasklist CSV rows: `"name.exe","1234",…`.
-	local names: { [string]: string } = {}
-	for name, pid in string.gmatch(out, '\n"([^"]*)","(%d+)"') do
-		names[pid] = name
+	local rows, names = windows_listeners(out)
+	for _, r in rows do
+		add(r.addr, r.port, names[r.pid])
 	end
 	for line in string.gmatch(out, "[^\r\n]+") do
 		local f = {}
 		for w in string.gmatch(line, "%S+") do
 			table.insert(f, w)
 		end
-		if f[1] == "TCP" and f[3] and string.find(f[3], ":0$") then
-			-- Windows netstat: `TCP 0.0.0.0:135 0.0.0.0:0 LISTENING 1012`. The
-			-- state word is localized; a listener is what has no foreign port.
-			local addr, port = split_addr(f[2], ":")
-			add(addr, port, f[5] and names[f[5]])
-		elseif tool == "ss" and f[1] == "LISTEN" and f[4] then
+		if tool == "ss" and f[1] == "LISTEN" and f[4] then
 			local addr, port = split_addr(f[4], ":")
 			add(addr, port, string.match(line, 'users:%(%("([^"]+)"'))
 		elseif tool == "lsof" and string.find(line, "%(LISTEN%)%s*$") and #f >= 3 then
