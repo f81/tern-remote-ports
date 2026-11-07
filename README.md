@@ -70,8 +70,10 @@ would run wherever the panes run, and that can be the remote itself.
 Connections run with `BatchMode=yes`, so keys and the ssh agent work without
 prompts. When a connection needs a password, a passphrase or a new host key,
 the plugin offers **Connect in a terminal**. That opens a local tab running
-the same master where ssh can ask. The plugin waits for the master (up to
-3 minutes), then carries on with what you were doing.
+the same master where ssh can ask, on this machine. If no local terminal
+opens, the command goes to the clipboard instead, to paste into one. The
+plugin waits for the master (up to 3 minutes), then carries on with what
+you were doing.
 
 Masters only start when you ask. When a link drops, the panel shows the host
 as disconnected with a **Connect** button, and its forwards come back once
