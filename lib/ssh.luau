@@ -134,14 +134,30 @@ function M.cancel(f: Forward): { string }
 	return argv(f.host, { "-O", "cancel", "-L", M.spec(f) })
 end
 
--- The remote's listening TCP sockets, through the master. The script is
--- POSIX sh whatever the login shell is; a marker line names the tool used.
-local SCAN = "if command -v ss >/dev/null 2>&1; then echo @ss; ss -ltnpH; "
+-- The remote's listening TCP sockets, through the master, in two flavors
+-- since ssh hands the command to the remote's login shell. A marker line
+-- names the tool used, and parse_scan reads any of them.
+--
+-- POSIX: one sh script, whatever the login shell (bash, zsh, fish…).
+local SCAN_POSIX = "if command -v ss >/dev/null 2>&1; then echo @ss; ss -ltnpH; "
 	.. "elif command -v lsof >/dev/null 2>&1; then echo @lsof; lsof -nP -iTCP -sTCP:LISTEN; "
 	.. "else echo @netstat; netstat -an; fi"
+-- Windows: OpenSSH's default shell there is cmd or PowerShell; both run
+-- `cmd /c "…"` the same way, and `&` chains inside cmd. tasklist maps the
+-- pids netstat prints to program names.
+local SCAN_WINDOWS = 'cmd /c "echo @win& netstat -ano & tasklist /fo csv /nh"'
 
-function M.scan(host: string): { string }
-	return argv(host, { "-o", "ControlMaster=no", "-o", "BatchMode=yes" }, "sh -c " .. shell_quote(SCAN))
+export type ScanKind = "posix" | "windows"
+
+function M.scan(host: string, kind: ScanKind): { string }
+	local command = if kind == "windows" then SCAN_WINDOWS else "sh -c " .. shell_quote(SCAN_POSIX)
+	return argv(host, { "-o", "ControlMaster=no", "-o", "BatchMode=yes" }, command)
+end
+
+-- Whether a scan's output came from a script that ran (it may list no ports).
+-- A shell that didn't understand the command prints no marker line.
+function M.scanned(out: string): boolean
+	return string.find(out, "^@%a+") ~= nil or string.find(out, "\n@%a+") ~= nil
 end
 
 -- This machine's listening TCP sockets, `-F` fields: `p<pid>` then `n<addr>` lines.
@@ -227,12 +243,22 @@ function M.parse_scan(out: string): { Listener }
 		end
 		l.process = l.process or process
 	end
-	for line in string.gmatch(out, "[^\n]+") do
+	-- Windows tasklist CSV rows: `"name.exe","1234",…`.
+	local names: { [string]: string } = {}
+	for name, pid in string.gmatch(out, '\n"([^"]*)","(%d+)"') do
+		names[pid] = name
+	end
+	for line in string.gmatch(out, "[^\r\n]+") do
 		local f = {}
 		for w in string.gmatch(line, "%S+") do
 			table.insert(f, w)
 		end
-		if tool == "ss" and f[1] == "LISTEN" and f[4] then
+		if f[1] == "TCP" and f[3] and string.find(f[3], ":0$") then
+			-- Windows netstat: `TCP 0.0.0.0:135 0.0.0.0:0 LISTENING 1012`. The
+			-- state word is localized; a listener is what has no foreign port.
+			local addr, port = split_addr(f[2], ":")
+			add(addr, port, f[5] and names[f[5]])
+		elseif tool == "ss" and f[1] == "LISTEN" and f[4] then
 			local addr, port = split_addr(f[4], ":")
 			add(addr, port, string.match(line, 'users:%(%("([^"]+)"'))
 		elseif tool == "lsof" and string.find(line, "%(LISTEN%)%s*$") and #f >= 3 then

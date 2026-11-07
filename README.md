@@ -38,9 +38,13 @@ would run wherever the panes run, and that can be the remote itself.
   socket, so no ssh process runs per forward. The master stays up across
   windows, plugin reloads and Tern restarts until you disconnect or the link
   drops.
-- **Listening ports.** These come from `ss -ltnpH` on the remote. Hosts
-  without `ss` fall back to `lsof`, then `netstat`. The command runs through
-  the master.
+- **Listening ports.** The command runs through the master, in the remote's
+  login shell:
+  - macOS, Linux and BSD: an `sh` script using `ss -ltnpH`, else `lsof`,
+    else `netstat`.
+  - Windows (OpenSSH Server with cmd or PowerShell): `netstat -ano` for the
+    ports and `tasklist` for the program names. It runs when the `sh` script
+    gets no answer, and the plugin remembers which one worked for each host.
 - **Saved state.** The forwards you asked for are kept in the plugin's
   `kv.json`, which every window shares.
 - **Checks every 10 s.**
@@ -69,4 +73,5 @@ it is connected again.
 - OpenSSH 7.7 or later (for `ssh://` destinations and `-O forward`).
 - `lsof` on this machine, which macOS ships. Without it, forwards are only
   checked through the master.
-- `ss`, `lsof` or `netstat` on the remote, to list its ports.
+- On the remote, to list its ports: `ss`, `lsof` or `netstat` on Unix, or
+  nothing extra on Windows.

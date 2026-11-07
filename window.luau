@@ -616,15 +616,31 @@ local function disconnect(host: string)
 	end)
 end
 
+-- Which scan a host's login shell runs, once one has worked.
+local scan_kind: { [string]: ssh.ScanKind } = {}
+
+-- Lists host's listening ports. Tries the scan that worked last (POSIX
+-- first); output without its marker means the shell didn't run it, so the
+-- other one (Windows' cmd or PowerShell) gets a turn.
 local function scan(host: string, cb: (cx: WindowCx) -> ())
-	run(ssh.scan(host), 15000, function(res, cx)
-		if res.status == 0 then
-			scans[host] = { at = tern.now(), ports = ssh.parse_scan(res.stdout) }
-		else
-			scans[host] = { at = tern.now(), error = if res.timed_out then "timed out" else ssh.error_line(res.stderr) }
-		end
-		cb(cx)
-	end)
+	local first: ssh.ScanKind = scan_kind[host] or "posix"
+	local second: ssh.ScanKind = if first == "posix" then "windows" else "posix"
+	local function attempt(kind: ssh.ScanKind, first_error: string?)
+		run(ssh.scan(host, kind), 15000, function(res, cx)
+			if ssh.scanned(res.stdout) then
+				scan_kind[host] = kind
+				scans[host] = { at = tern.now(), ports = ssh.parse_scan(res.stdout) }
+			elseif first_error == nil and not res.timed_out and host_state[host] and host_state[host].state == "up" then
+				attempt(second, ssh.error_line(res.stderr))
+				return
+			else
+				local err = if res.timed_out then "timed out" else first_error or ssh.error_line(res.stderr)
+				scans[host] = { at = tern.now(), error = err }
+			end
+			cb(cx)
+		end)
+	end
+	attempt(first, nil)
 end
 
 -- Reads back what is up, restores forwards whose master is up but whose port
