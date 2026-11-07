@@ -1,0 +1,9 @@
+schema = 1
+id = "ports"
+name = "Ports"
+version = "0.1.0"
+description = "Forward ports from ssh hosts to localhost: pick a listening port, open it, stop it, from the palette, a panel and the status line."
+icon = "swap"
+# Window half only: forwards are made by ssh on this machine, which the
+# window half runs on; a host half would run wherever the panes do.
+window = "window.luau"
