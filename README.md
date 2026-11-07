@@ -81,7 +81,7 @@ it is connected again.
 
 ## Versions
 
-The version lives in `plugin.toml` (`version = "0.1.0"`), and the Ports
+The version lives in the `version` key of `plugin.toml`, and the Ports
 panel shows it in its head, so a bug report can name the build it came
 from. Tern never compares versions: it shows the one you have and leaves
 updating to you.
