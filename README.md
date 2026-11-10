@@ -47,6 +47,12 @@ would run wherever the panes run, and that can be the remote itself.
   socket, so no ssh process runs per forward. The master stays up across
   windows, plugin reloads and Tern restarts until you disconnect or the link
   drops.
+- **One connection per machine.** A machine often has several names: `gx10`
+  and `gx10.tailnet.ts.net`, or an alias from `~/.ssh/config`. Ports treats
+  two names as the same machine when `ssh -G` gives them the same user, and
+  they also share an address or a server host key in known_hosts. Picking a
+  second name reuses the connection the panel already has. A duplicate host
+  with no forwards is dropped from the panel, and its connection is closed.
 - **Windows: one process per forward.** Windows OpenSSH does not support
   control-socket multiplexing. Ports uses `ssh -N -L` without a control
   socket, reads local listeners with `netstat` and `tasklist`, and stops

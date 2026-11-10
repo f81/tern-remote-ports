@@ -81,6 +81,11 @@ type Tunnel = { settled: boolean, stopping: boolean }
 local tunnels: { [string]: Tunnel } = {}
 -- Callbacks waiting on a host being connected, by host.
 local starting: { [string]: { (ok: boolean, err: string?, cx: WindowCx) -> () } } = {}
+-- Who each host name reaches (see identify); false when `ssh -G` failed.
+type Identity = { user: string, addr: string, keys: { string } }
+local identities: { [string]: Identity | false } = {}
+-- Hosts being dropped as another stored host's alias.
+local merging: { [string]: boolean } = {}
 local reconciling = false
 local reconcile_started = 0
 
@@ -351,8 +356,10 @@ local function host_block(host: string): Node
 			end
 			local t = tern.ui.table({
 				{ id = "port", head = "Port", align = "end", mono = true },
-				{ id = "addr", head = "Listening on", mono = true, grow = 1, truncate = "end", priority = -1 },
-				{ id = "proc", head = "Program", align = "center" },
+				-- Program grows too: "Listening on" hides first when narrow, and with no growing column left
+				-- the table would shrink to its content instead of filling the pane.
+				{ id = "addr", head = "Listening on", mono = true, grow = 2, truncate = "end", priority = -1 },
+				{ id = "proc", head = "Program", align = "center", grow = 1 },
 				{ id = "act", head = "", align = "center" },
 			}, rows, { empty = "Nothing listens on TCP there" })
 			t.p = t.p or {}
@@ -535,6 +542,7 @@ local function connect_in_terminal(cx: WindowCx, host: string, after: ((cx: Wind
 	render(cx)
 	local deadline = tern.now() + TERMINAL_WAIT_MS
 	local function connected(pcx: WindowCx, pid: number?)
+		identities[host] = nil
 		host_state[host] = { state = "up", pid = pid }
 		pcx:toast("success", "Connected to " .. host)
 		render(pcx)
@@ -817,7 +825,8 @@ local function stop_forward(k: string)
 	end)
 end
 
-local function disconnect(host: string)
+-- Ends host's connection and its forwards and forgets it.
+local function close_host(host: string, cb: (cx: WindowCx) -> ())
 	if not ssh.MULTIPLEX then
 		refresh_local(function(cx)
 			for _, f in forwards() do
@@ -826,17 +835,130 @@ local function disconnect(host: string)
 				end
 			end
 			forget_host(host)
-			cx:toast("success", "Disconnected " .. host)
-			render(cx)
+			cb(cx)
 		end)
 		return
 	end
 	run(ssh.exit(host), 8000, function(_res, cx)
 		forget_host(host)
 		pcall(tern.fs.remove, ssh.socket(host))
+		cb(cx)
+	end)
+end
+
+local function disconnect(host: string)
+	close_host(host, function(cx)
 		cx:toast("success", "Disconnected " .. host)
 		render(cx)
 	end)
+end
+
+---------------------------------------------------------------------------
+-- Aliases
+--
+-- Ports keys hosts by the name picked, and one machine often has several
+-- (`gx10`, `gx10.tailnet.ts.net`, an ssh config alias). Names with the same
+-- ssh user that reach the same address or present a shared server host key
+-- are one machine, which gets one connection: the first stored name's.
+
+-- Reads who host reaches: `ssh -G` for its user and address, then its host
+-- keys from the known_hosts files ssh uses. Cached; connect_in_terminal
+-- drops the entry, since a login there may accept a new key.
+local function identify(host: string, cb: (id: Identity?, cx: WindowCx) -> ())
+	local known = identities[host]
+	if known ~= nil then
+		tern.timer(0, function(cx: WindowCx?)
+			cb(if known then known else nil, cx :: WindowCx)
+		end)
+		return
+	end
+	run(ssh.resolve(host), 5000, function(res, cx)
+		local r = if res.status == 0 then ssh.parse_resolved(res.stdout) else nil
+		if not r then
+			identities[host] = false
+			cb(nil, cx)
+			return
+		end
+		local resolved = r :: ssh.Resolved
+		local id: Identity = { user = resolved.user, addr = resolved.addr, keys = {} }
+		local files = {}
+		for _, path in resolved.known_hosts do
+			local ok, exists = pcall(tern.fs.exists, path)
+			if ok and exists then
+				table.insert(files, path)
+			end
+		end
+		local pending = #files
+		if pending == 0 then
+			identities[host] = id
+			cb(id, cx)
+			return
+		end
+		for _, path in files do
+			run(ssh.known_keys(resolved.keyname, path), 5000, function(kres, kcx)
+				for _, k in ssh.parse_known_keys(kres.stdout) do
+					table.insert(id.keys, k)
+				end
+				pending -= 1
+				if pending == 0 then
+					identities[host] = id
+					cb(id, kcx)
+				end
+			end)
+		end
+	end)
+end
+
+local function same_machine(a: Identity, b: Identity): boolean
+	if a.user ~= b.user then
+		return false
+	end
+	if a.addr == b.addr then
+		return true
+	end
+	for _, k in a.keys do
+		if table.find(b.keys, k) then
+			return true
+		end
+	end
+	return false
+end
+
+-- The first host in `among` reaching host's machine, from cached identities;
+-- nil when none does or host itself comes first.
+local function alias_of(host: string, among: { string }): string?
+	local id = identities[host]
+	if not id then
+		return nil
+	end
+	for _, h in among do
+		if h == host then
+			return nil
+		end
+		local other = identities[h]
+		if other and same_machine(id, other) then
+			return h
+		end
+	end
+	return nil
+end
+
+-- Calls cb with the stored host to use for host: an earlier name of its
+-- machine, else host itself.
+local function canonical(host: string, cb: (host: string, cx: WindowCx) -> ())
+	local stored = all_hosts()
+	local names = { host }
+	table.move(stored, 1, #stored, 2, names)
+	local i = 1
+	local function step(_id: Identity?, cx: WindowCx)
+		i += 1
+		if names[i] then
+			identify(names[i], step)
+		else
+			cb(alias_of(host, stored) or host, cx)
+		end
+	end
+	identify(host, step)
 end
 
 -- Which scan a host's login shell runs, once one has worked.
@@ -881,6 +1003,31 @@ local function reconcile(opts: { scan: boolean, force: boolean? })
 
 	local function apply(cx: WindowCx)
 		reconciling = false
+		-- A stored host whose machine an earlier one already reaches goes,
+		-- with its connection, unless forwards ride it. Identities not read
+		-- yet are read for a later pass.
+		for _, h in hosts do
+			if identities[h] == nil then
+				identify(h, function() end)
+				continue
+			end
+			local alias = alias_of(h, hosts)
+			if not alias or merging[h] or starting[h] then
+				continue
+			end
+			local carries = false
+			for _, f in forwards() do
+				carries = carries or f.host == h
+			end
+			if not carries then
+				merging[h] = true
+				close_host(h, function(mcx)
+					merging[h] = nil
+					mcx:toast("info", h .. " is " .. (alias :: string), "Same machine: Ports keeps one connection to it")
+					render(mcx)
+				end)
+			end
+		end
 		if not ssh.MULTIPLEX and local_ports then
 			-- Direct mode, fresh VM (a reload, a new window): a host is
 			-- connected when ssh still holds one of its forwards.
@@ -1012,19 +1159,23 @@ end
 local function pick_host(cx: WindowCx, cb: (host: string, cx: WindowCx) -> ())
 	local items = {}
 	local seen: { [string]: boolean } = {}
+	local stored = all_hosts()
 	local function add(host: string, group: string, detail: string?, icon: string)
 		if seen[host] or not ssh.valid_host(host) then
 			return
 		end
 		seen[host] = true
-		local hs = host_state[host]
+		-- A name of a machine the panel already holds shows that host's state.
+		local alias = alias_of(host, stored)
+		local hs = host_state[alias or host]
+		local up = hs ~= nil and hs.state == "up"
 		table.insert(items, {
 			label = host,
-			detail = if hs and hs.state == "up" then "connected" else detail,
+			detail = if alias then "same machine as " .. alias .. (if up then ", connected" else "") elseif up then "connected" else detail,
 			group = group,
 			icon = icon,
 			host = host,
-			current = hs ~= nil and hs.state == "up",
+			current = up,
 		})
 	end
 	for _, h in strings(KV_RECENT) do
@@ -1114,7 +1265,12 @@ end
 forward_flow = function(cx: WindowCx, host: string?)
 	if not host then
 		pick_host(cx, function(h, cx2)
-			forward_flow(cx2, h)
+			canonical(h, function(c, cx3)
+				if c ~= h then
+					cx3:toast("info", h .. " is " .. c, "Same machine: using that connection")
+				end
+				forward_flow(cx3, c)
+			end)
 		end)
 		return
 	end

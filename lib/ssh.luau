@@ -455,6 +455,59 @@ function M.parse_config(text: string, include: (string) -> ()): { string }
 	return hosts
 end
 
+-- What ssh makes of host without connecting: `ssh -G` applies the config
+-- (aliases, `User`, `HostName`, `Port`, `HostKeyAlias`) and prints the result.
+function M.resolve(host: string): { string }
+	return { "ssh", "-G", "--", host }
+end
+
+-- From `ssh -G` output: the login user, the address as `host` or
+-- `[host]:port`, the name its host keys are filed under in known_hosts,
+-- and the known_hosts files ssh reads.
+export type Resolved = { user: string, addr: string, keyname: string, known_hosts: { string } }
+
+function M.parse_resolved(out: string): Resolved?
+	local opts: { [string]: string } = {}
+	for line in string.gmatch(out, "[^\r\n]+") do
+		local key, value = string.match(line, "^(%S+)%s+(.-)%s*$")
+		if key and value and opts[string.lower(key)] == nil then
+			opts[string.lower(key)] = value
+		end
+	end
+	local port = tonumber(opts.port or "22")
+	if not opts.user or not opts.hostname or not port then
+		return nil
+	end
+	local addr = if port == 22 then opts.hostname else "[" .. opts.hostname .. "]:" .. port
+	local files = {}
+	for _, key in { "userknownhostsfile", "globalknownhostsfile" } do
+		for path in string.gmatch(opts[key] or "", "%S+") do
+			if path ~= "none" then
+				table.insert(files, path)
+			end
+		end
+	end
+	return { user = opts.user, addr = string.lower(addr), keyname = opts.hostkeyalias or addr, known_hosts = files }
+end
+
+-- The keys file holds for name (hashed entries included); exits 1 when none.
+function M.known_keys(name: string, file: string): { string }
+	return { "ssh-keygen", "-F", name, "-f", file }
+end
+
+-- The key blobs in `ssh-keygen -F` output: `<hosts> <type> <base64>` lines,
+-- skipping its `# Host … found` comments and `@cert-authority`/`@revoked` lines.
+function M.parse_known_keys(out: string): { string }
+	local keys = {}
+	for line in string.gmatch(out, "[^\r\n]+") do
+		local blob = string.match(line, "^[^#@%s]%S*%s+%S+%s+(%S+)")
+		if blob and not table.find(keys, blob) then
+			table.insert(keys, blob)
+		end
+	end
+	return keys
+end
+
 -- The ssh destination behind a Tern remote host's address: Tern's own port
 -- is not ssh's, so `user@host:port` becomes `user@host`.
 function M.from_tern_address(address: string): string
