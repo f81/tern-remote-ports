@@ -245,6 +245,20 @@ function M.error_line(stderr: string): string
 	return if last == "" then "ssh failed" else last
 end
 
+-- Whether ssh's error says the login needs a prompt that BatchMode can't
+-- show: a refused key or password login, an unknown or changed host key.
+-- Trying again without prompts fails the same way, and repeated failed
+-- logins get an address banned (fail2ban, sshguard).
+function M.needs_prompt(err: string): boolean
+	local e = string.lower(err)
+	for _, s in { "permission denied", "host key verification failed", "too many authentication failures", "no supported authentication methods" } do
+		if string.find(e, s, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
 local function split_addr(s: string, sep: string): (string?, number?)
 	local addr, port = string.match(s, "^(.*)" .. sep .. "(%d+)$")
 	if not addr then

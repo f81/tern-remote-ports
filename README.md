@@ -64,8 +64,8 @@ would run wherever the panes run, and that can be the remote itself.
   - Windows (OpenSSH Server with cmd or PowerShell): `netstat -ano` for the
     ports and `tasklist` for the program names. It runs when the `sh` script
     gets no answer, and the plugin remembers which one worked for each host.
-- **Saved state.** The forwards you asked for are kept in the plugin's
-  `kv.json`, which every window shares.
+- **Saved state.** The forwards you asked for, and the reconnect schedule,
+  are kept in the plugin's `kv.json`, which every window shares.
 - **Checks every 10 s.**
   - On macOS/Linux, `ssh -O check` tells whether each master is up.
   - Local listeners come from `lsof`, or `netstat`/`tasklist` on Windows.
@@ -89,9 +89,19 @@ On Windows, **Connect in a terminal** instead runs a one-time login to accept
 the host key. Load your key into the ssh agent before forwarding; passwords
 entered in that terminal do not carry over to tunnels. There is no master.
 
-Masters only start when you ask. When a link drops, the panel shows the host
-as disconnected with a **Connect** button, and its forwards come back once
-it is connected again.
+A host carrying forwards reconnects on its own whenever it is down: after
+its link drops, or when Tern starts. Ports retries without prompts, waiting
+10 s, 30 s, 1 min, 2 min, then 5 min between tries, and the forwards come
+back once it is connected. The windows share one schedule, so a host gets
+one try at a time however many windows are open. The panel shows the last
+error and when the next try is due.
+
+Tries stop when the login needs a prompt: a refused key or password login,
+or an unknown or changed host key. Trying again would fail the same way,
+and repeated failed logins can get your address banned (fail2ban,
+sshguard). The host then waits for **Connect** or **In a terminal**, and
+either one starts the tries over. Stopping a host's last forward or
+**Forget** ends them. Other connections start only when you ask.
 
 ## Versions
 

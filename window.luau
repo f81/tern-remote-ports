@@ -13,8 +13,9 @@
 -- (`-O check`) and this machine's listening sockets (lsof, or netstat on
 -- Windows). A forward whose host is connected but whose port isn't held
 -- (after a reconnect) is started again; a duplicate fails to bind and goes
--- away, so two windows doing it at once is harmless. Connections only start
--- on a user action.
+-- away, so two windows doing it at once is harmless. A host carrying
+-- forwards reconnects on its own when it is down, without prompts and
+-- backing off (see auto_reconnect); other connections start on a user action.
 --
 -- All of it runs here, not in the host half: the window half runs on this
 -- machine, the host half wherever the panes run (possibly the remote itself).
@@ -37,7 +38,13 @@ local TERMINAL_WAIT_MS = 180000
 local KV_FORWARDS = "forwards" -- { Forward }: what the user asked for
 local KV_HOSTS = "hosts" -- { string }: hosts shown in the panel (connected through Ports)
 local KV_RECENT = "recent" -- { string }: hosts picked lately, newest first
+local KV_RECONNECT = "reconnect" -- { [string]: Retry }: auto-reconnect schedule by host
 local RECENT_MAX = 8
+-- Auto-reconnect: the wait after a host's nth try, in seconds; the last repeats.
+local RETRY_S = { 10, 30, 60, 120, 300 }
+-- Auto-reconnect: how long a window waits after claiming a try before
+-- reading the claim back, so a claim another window overwrote loses.
+local CLAIM_SETTLE_MS = 500
 
 -- The manifest's version, read once: the panel shows it, so a bug report can
 -- name the build it came from. The manifest is the only place it lives;
@@ -172,6 +179,72 @@ local function all_hosts(): { string }
 		end
 	end
 	return out
+end
+
+local function carries(host: string): boolean
+	for _, f in forwards() do
+		if f.host == host then
+			return true
+		end
+	end
+	return false
+end
+
+-- Auto-reconnect schedule, shared by every window: when a host's next try
+-- may start (os.time seconds), its tries since it last forwarded, the
+-- window that claimed the latest try, and the error of a try that needed a
+-- prompt, which stops the tries until a user action.
+type Retry = { at: number, tries: number, by: string?, stop: string? }
+
+-- This VM in claims: a live table's address, with the clock for windows in other processes.
+local ME = string.format("%s %.3f", tostring({}), tern.now())
+
+local function retries(): { [string]: Retry }
+	local ok, v = pcall(tern.kv.get, KV_RECONNECT)
+	local out: { [string]: Retry } = {}
+	if ok and type(v) == "table" then
+		for host, r in v do
+			if type(host) == "string" and type(r) == "table" and type(r.at) == "number" and type(r.tries) == "number" then
+				out[host] = {
+					at = r.at,
+					tries = r.tries,
+					by = if type(r.by) == "string" then r.by else nil,
+					stop = if type(r.stop) == "string" then r.stop else nil,
+				}
+			end
+		end
+	end
+	return out
+end
+
+local function set_retry(host: string, r: Retry?)
+	local all = retries()
+	if all[host] == nil and r == nil then
+		return
+	end
+	all[host] = r
+	tern.kv.set(KV_RECONNECT, if next(all) == nil then nil else all)
+end
+
+-- A user's connection to host: tries start over, and wait secs while it runs.
+local function hold_retries(host: string, secs: number)
+	if carries(host) then
+		set_retry(host, { at = os.time() + secs, tries = 0, by = ME })
+	end
+end
+
+-- A connection attempt's outcome: connected ends the schedule, a failure
+-- needing a prompt stops it, and other failures leave it to run, ending a
+-- user's hold (tries 0) so the tries start now.
+local function note_try(host: string, ok: boolean, err: string?)
+	local r = retries()[host]
+	if ok then
+		set_retry(host, nil)
+	elseif err and ssh.needs_prompt(err) and carries(host) then
+		set_retry(host, { at = if r then r.at else 0, tries = if r then r.tries else 0, stop = err })
+	elseif r and r.tries == 0 then
+		set_retry(host, nil)
+	end
 end
 
 ---------------------------------------------------------------------------
@@ -322,7 +395,13 @@ local function host_block(host: string): Node
 		meta = span("  connecting…", "muted")
 		buttons = { button("Connect", "connect:" .. host, { busy = true, size = "sm" }) }
 	elseif st.state == "down" then
-		meta = span("  " .. (st.error or "not connected"), "error")
+		local why = st.error or "not connected"
+		local r = retries()[host]
+		if r and not r.stop then
+			local wait = r.at - os.time()
+			why ..= if wait > 0 then string.format(" · retrying in %d s", wait) else " · retrying"
+		end
+		meta = span("  " .. why, "error")
 		buttons = {
 			button("Connect", "connect:" .. host, { icon = "log-in", size = "sm" }),
 			button("In a terminal", "terminal:" .. host, { icon = "terminal", variant = "quiet", size = "sm" }),
@@ -436,6 +515,7 @@ end
 -- Connections
 
 local function finish_start(host: string, ok: boolean, err: string?, cx: WindowCx)
+	note_try(host, ok, err)
 	local waiting = starting[host] or {}
 	starting[host] = nil
 	for _, cb in waiting do
@@ -538,11 +618,13 @@ local function connect_in_terminal(cx: WindowCx, host: string, after: ((cx: Wind
 		cx:toast("error", "Couldn't open a local terminal", "Copied the ssh command: run it in a terminal on this machine. " .. tostring(err))
 	end
 	remember_host(host)
+	hold_retries(host, TERMINAL_WAIT_MS // 1000)
 	host_state[host] = { state = "connecting" }
 	render(cx)
 	local deadline = tern.now() + TERMINAL_WAIT_MS
 	local function connected(pcx: WindowCx, pid: number?)
 		identities[host] = nil
+		note_try(host, true, nil)
 		host_state[host] = { state = "up", pid = pid }
 		pcx:toast("success", "Connected to " .. host)
 		render(pcx)
@@ -603,6 +685,25 @@ local function connect_failed(cx: WindowCx, host: string, err: string?, after: (
 		if item and cx2 then
 			connect_in_terminal(cx2, host, after)
 		end
+	end)
+end
+
+-- Tries host again without prompts once this window holds the try: two
+-- windows may claim it at once, the last write wins, and only its writer
+-- connects. `after` runs once connected.
+local function auto_reconnect(host: string, r: Retry?, after: (cx: WindowCx) -> ())
+	local tries = (if r then r.tries else 0) + 1
+	set_retry(host, { at = os.time() + RETRY_S[math.min(tries, #RETRY_S)], tries = tries, by = ME })
+	tern.timer(CLAIM_SETTLE_MS, function(_cx: WindowCx?)
+		local claim = retries()[host]
+		if not claim or claim.by ~= ME or claim.tries ~= tries or starting[host] then
+			return
+		end
+		ensure_connected(host, function(ok, _err, cx)
+			if ok then
+				after(cx)
+			end
+		end)
 	end)
 end
 
@@ -1015,11 +1116,7 @@ local function reconcile(opts: { scan: boolean, force: boolean? })
 			if not alias or merging[h] or starting[h] then
 				continue
 			end
-			local carries = false
-			for _, f in forwards() do
-				carries = carries or f.host == h
-			end
-			if not carries then
+			if not carries(h) then
 				merging[h] = true
 				close_host(h, function(mcx)
 					merging[h] = nil
@@ -1077,6 +1174,30 @@ local function reconcile(opts: { scan: boolean, force: boolean? })
 				end)
 			elseif not up and fwd_state[k] ~= "restoring" then
 				fwd_state[k] = if hs and hs.state == "connecting" then "unknown" else "down"
+			end
+		end
+		-- Down hosts carrying forwards reconnect on their own. A host leaves
+		-- the schedule once one of its forwards is up, or when it carries
+		-- none: `forwarding` is nil then, else whether one is up.
+		local forwarding: { [string]: boolean } = {}
+		for _, f in forwards() do
+			forwarding[f.host] = forwarding[f.host] or fwd_state[key_of(f)] == "up"
+		end
+		local schedule = retries()
+		for host in schedule do
+			if forwarding[host] ~= false then
+				set_retry(host, nil)
+				schedule[host] = nil
+			end
+		end
+		for _, host in hosts do
+			local hs = host_state[host]
+			local r = schedule[host]
+			local due = not (r and (r.stop or os.time() < r.at))
+			if due and forwarding[host] == false and hs and hs.state == "down" and not starting[host] and not merging[host] then
+				auto_reconnect(host, r, function(rcx)
+					reconcile({ scan = #panels(rcx) > 0 })
+				end)
 			end
 		end
 		render(cx)
@@ -1436,6 +1557,7 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		scan(arg :: string, render)
 	elseif act == "connect" then
 		local host = arg :: string
+		hold_retries(host, 60)
 		ensure_connected(host, function(ok, err, cx2)
 			if ok then
 				reconcile({ scan = true, force = true })
