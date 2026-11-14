@@ -13,9 +13,11 @@
 -- (`-O check`) and this machine's listening sockets (lsof, or netstat on
 -- Windows). A forward whose host is connected but whose port isn't held
 -- (after a reconnect) is started again; a duplicate fails to bind and goes
--- away, so two windows doing it at once is harmless. A host carrying
--- forwards reconnects on its own when it is down, without prompts and
--- backing off (see auto_reconnect); other connections start on a user action.
+-- away, so two windows doing it at once is harmless. A forward to the host
+-- itself stops once nothing has listened on its remote port for
+-- IDLE_STOP_S (see retire_idle). A host carrying forwards reconnects on its
+-- own when it is down, without prompts and backing off (see
+-- auto_reconnect); other connections start on a user action.
 --
 -- All of it runs here, not in the host half: the window half runs on this
 -- machine, the host half wherever the panes run (possibly the remote itself).
@@ -39,12 +41,15 @@ local KV_FORWARDS = "forwards" -- { Forward }: what the user asked for
 local KV_HOSTS = "hosts" -- { string }: hosts shown in the panel (connected through Ports)
 local KV_RECENT = "recent" -- { string }: hosts picked lately, newest first
 local KV_RECONNECT = "reconnect" -- { [string]: Retry }: auto-reconnect schedule by host
+local KV_IDLE = "idle" -- { [string]: number }: when a forward's remote port went quiet, by forward key
 local RECENT_MAX = 8
 -- Auto-reconnect: the wait after a host's nth try, in seconds; the last repeats.
 local RETRY_S = { 10, 30, 60, 120, 300 }
 -- Auto-reconnect: how long a window waits after claiming a try before
 -- reading the claim back, so a claim another window overwrote loses.
 local CLAIM_SETTLE_MS = 500
+-- How long a forward's remote port may have nothing listening before the forward stops, in seconds.
+local IDLE_STOP_S = 300
 
 -- The manifest's version, read once: the panel shows it, so a bug report can
 -- name the build it came from. The manifest is the only place it lives;
@@ -93,6 +98,11 @@ type Identity = { user: string, addr: string, keys: { string } }
 local identities: { [string]: Identity | false } = {}
 -- Hosts being dropped as another stored host's alias.
 local merging: { [string]: boolean } = {}
+-- Forwards whose remote end is being reached for (retire_idle), and ones
+-- that answered while a scan listed nothing on their port: the scan can't
+-- see them (lsof run as the user misses other users' programs).
+local reaching: { [string]: boolean } = {}
+local unseen: { [string]: boolean } = {}
 local reconciling = false
 local reconcile_started = 0
 
@@ -188,6 +198,31 @@ local function carries(host: string): boolean
 		end
 	end
 	return false
+end
+
+-- When each forward's remote port was first found with nothing listening
+-- (os.time seconds), by forward key; see retire_idle.
+local function idles(): { [string]: number }
+	local ok, v = pcall(tern.kv.get, KV_IDLE)
+	local out: { [string]: number } = {}
+	if ok and type(v) == "table" then
+		for k, t in v do
+			if type(k) == "string" and type(t) == "number" then
+				out[k] = t
+			end
+		end
+	end
+	return out
+end
+
+local function set_idles(all: { [string]: number })
+	tern.kv.set(KV_IDLE, if next(all) == nil then nil else all)
+end
+
+local function set_idle(k: string, t: number?)
+	local all = idles()
+	all[k] = t
+	set_idles(all)
 end
 
 -- Auto-reconnect schedule, shared by every window: when a host's next try
@@ -322,11 +357,26 @@ local FWD_STATUS: { [string]: { text: string, dot: string } } = {
 	restoring = { text = "Restoring", dot = "pending" },
 	down = { text = "Host disconnected", dot = "error" },
 	conflict = { text = "Port taken here", dot = "warning" },
+	-- Up here, but nothing listens on the remote port (see retire_idle).
+	idle = { text = "Nothing listening", dot = "warning" },
 }
 
 local function remote_label(f: Forward): string
 	local rhost = if string.find(f.rhost, ":", 1, true) then "[" .. f.rhost .. "]" else f.rhost
 	return rhost .. ":" .. f.rport
+end
+
+-- f's status for the panel and pickers, and what explains it.
+local function status_of(f: Forward, idle: { [string]: number }): ({ text: string, dot: string }, string?)
+	local k = key_of(f)
+	local s = fwd_state[k] or "unknown"
+	local since = idle[k]
+	if s == "up" and since then
+		local mins = math.max(1, math.ceil((since + IDLE_STOP_S - os.time()) / 60))
+		return FWD_STATUS.idle,
+			string.format("Nothing listens on %s %s: forwarding stops in %d min unless something does", f.host, remote_label(f), mins)
+	end
+	return FWD_STATUS[s], fwd_error[k]
 end
 
 local function forward_of(host: string, rhost: string, rport: number): Forward?
@@ -353,12 +403,13 @@ end
 
 local function forwards_table(list: { Forward }): Node
 	local rows = {}
+	local idle = idles()
 	for _, f in list do
 		local k = key_of(f)
-		local st = FWD_STATUS[fwd_state[k] or "unknown"]
+		local st, why = status_of(f, idle)
 		table.insert(rows, {
 			id = k,
-			title = fwd_error[k],
+			title = why,
 			cells = {
 				span("localhost:" .. f.lport, "mono"),
 				span(remote_label(f), "mono"),
@@ -897,32 +948,40 @@ local function remove_forward(k: string)
 	set_forwards(kept)
 	fwd_state[k] = nil
 	fwd_error[k] = nil
+	unseen[k] = nil
 end
 
-local function stop_forward(k: string)
+-- Stops forwarding k and forgets it. `why` explains a stop the user didn't
+-- ask for (retire_idle): the toast gives it instead of ssh's answer.
+local function stop_forward(k: string, why: string?)
 	local f = find_forward(k)
 	if not f then
 		return
 	end
 	local fwd = f :: Forward
-	if not ssh.MULTIPLEX then
-		refresh_local(function(cx)
-			remove_forward(k)
-			kill_tunnel(fwd)
-			cx:toast("success", "Stopped forwarding localhost:" .. fwd.lport)
-			render(cx)
-		end)
-		return
-	end
-	run(ssh.cancel(fwd), 8000, function(res, cx)
-		remove_forward(k)
-		local up = host_state[fwd.host]
-		if res.status ~= 0 and up and up.state == "up" then
-			cx:toast("error", "ssh didn't confirm stopping localhost:" .. fwd.lport, ssh.error_line(res.stderr))
+	-- Forgotten before ssh is asked, so no reconcile restores it meanwhile
+	-- and another window stopping it too finds it gone.
+	remove_forward(k)
+	local function stopped(cx: WindowCx, err: string?)
+		if why then
+			cx:toast("info", "Stopped forwarding localhost:" .. fwd.lport, why)
+		elseif err then
+			cx:toast("error", "ssh didn't confirm stopping localhost:" .. fwd.lport, err)
 		else
 			cx:toast("success", "Stopped forwarding localhost:" .. fwd.lport)
 		end
 		render(cx)
+	end
+	if not ssh.MULTIPLEX then
+		refresh_local(function(cx)
+			kill_tunnel(fwd)
+			stopped(cx, nil)
+		end)
+		return
+	end
+	run(ssh.cancel(fwd), 8000, function(res, cx)
+		local up = host_state[fwd.host]
+		stopped(cx, if res.status ~= 0 and up and up.state == "up" then ssh.error_line(res.stderr) else nil)
 	end)
 end
 
@@ -1089,8 +1148,66 @@ local function scan(host: string, cb: (cx: WindowCx) -> ())
 	attempt(first, nil)
 end
 
+-- Stops forwards whose remote port nothing has listened on for IDLE_STOP_S,
+-- so a forward doesn't outlive its server. A scan of the connected host
+-- finding the port empty starts the clock, kept in kv so windows and
+-- reloads share it; a scan listing the port again, or the host going down,
+-- clears it. When it runs out, one connection through ssh has the last
+-- word: refused stops the forward; taken means the scan can't see the
+-- port (see unseen); anything else starts the clock over. Forwards through
+-- the host to another machine are never judged: a scan can't see there.
+local function retire_idle()
+	local was = idles()
+	local now = os.time()
+	local idle: { [string]: number } = {}
+	for _, f in forwards() do
+		local k = key_of(f)
+		local hs = host_state[f.host]
+		local s = scans[f.host]
+		if not hs or hs.state ~= "up" or unseen[k] then
+			continue
+		end
+		if not (s and s.ports) then
+			-- No reading of the host yet, or the scan failed: the clock holds.
+			idle[k] = was[k]
+			continue
+		end
+		if ssh.listening(f, s.ports :: { Listener }) ~= false then
+			continue
+		end
+		local since = was[k] or now
+		idle[k] = since
+		if now - since >= IDLE_STOP_S and not reaching[k] then
+			reaching[k] = true
+			run(ssh.reach(f), 5000, function(res, cx)
+				reaching[k] = nil
+				if res.status == 0 then
+					unseen[k] = true
+					set_idle(k, nil)
+					render(cx)
+				elseif ssh.refused(res.stderr) then
+					stop_forward(k, string.format("Nothing has listened on %s %s for %d min", f.host, remote_label(f), IDLE_STOP_S // 60))
+				elseif find_forward(k) then
+					set_idle(k, os.time())
+				end
+			end)
+		end
+	end
+	local changed = false
+	for k, t in idle do
+		changed = changed or was[k] ~= t
+	end
+	for k in was do
+		changed = changed or idle[k] == nil
+	end
+	if changed then
+		set_idles(idle)
+	end
+end
+
 -- Reads back what is up, restores forwards whose host is connected but whose
--- port isn't held, rescans hosts when asked, then renders.
+-- port isn't held, rescans hosts carrying forwards (and the rest when asked),
+-- stops forwards nothing listens behind, then renders.
 local function reconcile(opts: { scan: boolean, force: boolean? })
 	-- Every process has a timeout, so a reading finishes; the age check only
 	-- recovers from a callback that raised halfway.
@@ -1176,6 +1293,7 @@ local function reconcile(opts: { scan: boolean, force: boolean? })
 				fwd_state[k] = if hs and hs.state == "connecting" then "unknown" else "down"
 			end
 		end
+		retire_idle()
 		-- Down hosts carrying forwards reconnect on their own. A host leaves
 		-- the schedule once one of its forwards is up, or when it carries
 		-- none: `forwarding` is nil then, else whether one is up.
@@ -1218,7 +1336,7 @@ local function reconcile(opts: { scan: boolean, force: boolean? })
 			check(host, function(cx)
 				local hs = host_state[host]
 				local last = scans[host]
-				if opts.scan and hs and hs.state == "up" and (opts.force or not last or tern.now() - last.at >= SCAN_EVERY_MS) then
+				if (opts.scan or carries(host)) and hs and hs.state == "up" and (opts.force or not last or tern.now() - last.at >= SCAN_EVERY_MS) then
 					scan(host, done)
 				else
 					done(cx)
@@ -1412,8 +1530,9 @@ end
 
 local function pick_forward(cx: WindowCx, placeholder: string, icon: string, cb: (f: Forward, cx: WindowCx) -> ())
 	local items = {}
+	local idle = idles()
 	for _, f in forwards() do
-		local st = FWD_STATUS[fwd_state[key_of(f)] or "unknown"]
+		local st = status_of(f, idle)
 		table.insert(items, {
 			label = "localhost:" .. f.lport,
 			detail = f.host .. " " .. remote_label(f) .. " · " .. st.text,

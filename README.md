@@ -64,8 +64,9 @@ would run wherever the panes run, and that can be the remote itself.
   - Windows (OpenSSH Server with cmd or PowerShell): `netstat -ano` for the
     ports and `tasklist` for the program names. It runs when the `sh` script
     gets no answer, and the plugin remembers which one worked for each host.
-- **Saved state.** The forwards you asked for, and the reconnect schedule,
-  are kept in the plugin's `kv.json`, which every window shares.
+- **Saved state.** The forwards you asked for, the reconnect schedule, and
+  since when each forward's remote port has had nothing listening are kept
+  in the plugin's `kv.json`, which every window shares.
 - **Checks every 10 s.**
   - On macOS/Linux, `ssh -O check` tells whether each master is up.
   - Local listeners come from `lsof`, or `netstat`/`tasklist` on Windows.
@@ -74,6 +75,15 @@ would run wherever the panes run, and that can be the remote itself.
   - A forward whose port another program also holds is marked **Port taken
     here**. ssh binds both 127.0.0.1 and ::1 and reports success if either
     one binds.
+- **Forwards stop when their server does.** A host carrying forwards is
+  scanned every 30 s, with the panel closed too. A forward whose remote port
+  nothing listens on any more shows **Nothing listening**. After 5 minutes
+  like that, one connection through ssh to that port decides: when the
+  host refuses it, the forward stops and a toast says so. A server that
+  restarts within those 5 minutes keeps its forward, and the host going
+  down starts them over. Forwards through the host to another machine
+  (`db.internal:5432`) are never stopped this way, since a scan can't see
+  that machine. On Windows each scan is a new ssh login.
 
 ## Connecting
 

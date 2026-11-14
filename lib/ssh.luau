@@ -194,6 +194,19 @@ function M.cancel(f: Forward): { string }
 	return argv(f.host, { "-O", "cancel", "-L", M.spec(f) })
 end
 
+-- One connection to f's remote end, made as the forward makes them: ssh
+-- opens it from the host (`-W`) and, stdin being empty (`-n`), ends it at
+-- once. Exits 0 once something accepted it; see refused.
+function M.reach(f: Forward): { string }
+	return argv(f.host, {
+		"-n",
+		"-o", "ControlMaster=no",
+		"-o", "BatchMode=yes",
+		"-o", "ConnectTimeout=10",
+		"-W", bracket(f.rhost) .. ":" .. f.rport,
+	})
+end
+
 -- The remote's listening TCP sockets, through the master, in two flavors
 -- since ssh hands the command to the remote's login shell. A marker line
 -- names the tool used, and parse_scan reads any of them.
@@ -257,6 +270,14 @@ function M.needs_prompt(err: string): boolean
 		end
 	end
 	return false
+end
+
+-- Whether reach's error says nothing on the host took the connection, not
+-- that ssh failed: "Session open refused by peer" through a master,
+-- "channel 0: open failed: connect failed: …" on a connection of its own.
+function M.refused(stderr: string): boolean
+	local e = string.lower(stderr)
+	return string.find(e, "open refused", 1, true) ~= nil or string.find(e, "open failed", 1, true) ~= nil
 end
 
 local function split_addr(s: string, sep: string): (string?, number?)
@@ -393,6 +414,30 @@ function M.parse_scan(out: string): { Listener }
 		return a.port < b.port
 	end)
 	return list
+end
+
+local function unbracket(addr: string): string
+	return string.lower((string.gsub(addr, "^%[(.*)%]$", "%1")))
+end
+
+-- What a scan's listeners say about forward f: true when something listens
+-- on its port, false when nothing does and f goes to the host itself
+-- (loopback, a wildcard, or an address the host listens on), nil when f
+-- goes through the host to another machine, which a scan can't see.
+function M.listening(f: Forward, ports: { Listener }): boolean?
+	local rhost = unbracket(f.rhost)
+	local here = rhost == "localhost" or rhost == "::1" or WILDCARD[rhost] == true or string.find(rhost, "^127%.") ~= nil
+	local open = false
+	for _, l in ports do
+		open = open or l.port == f.rport
+		for _, a in l.addrs do
+			here = here or unbracket(a) == rhost
+		end
+	end
+	if not here then
+		return nil
+	end
+	return open
 end
 
 -- A typed forward: `8080`, `3000:8080` (local:remote), `db.internal:5432`
